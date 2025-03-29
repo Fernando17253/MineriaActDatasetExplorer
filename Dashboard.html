@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard de Datos en Tiempo Real</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f0f2f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            text-align: center;
+        }
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Dashboard de Datos en Tiempo Real</h1>
+        <button onclick="fetchData()">Actualizar Datos</button>
+
+        <div class="grid">
+            <div class="card">
+                <h2>Irradiancia vs Potencia Generada</h2>
+                <div id="irradiance-power-graph"></div>
+            </div>
+
+            <div class="card">
+                <h2>Histograma de Voltaje DC</h2>
+                <div id="dc-voltage-histogram"></div>
+            </div>
+
+            <div class="card">
+                <h2>Temperatura vs Potencia Generada</h2>
+                <div id="temperature-power-graph"></div>
+            </div>
+
+            <div class="card">
+                <h2>Efecto del Viento en la Temperatura</h2>
+                <div id="wind-temperature-graph"></div>
+            </div>
+
+            <div class="card">
+                <h2>Comparación de Energía Generada por Hora</h2>
+                <div id="energy-hourly-graph"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = "http://localhost:8000/current-time-data";
+
+        async function fetchData() {
+            try {
+                const response = await fetch(API_URL);
+                const data = await response.json();
+
+                if (!data.datasets) {
+                    console.log("No data available");
+                    return;
+                }
+
+                updateGraphs(data.datasets);
+            } catch (error) {
+                console.error("Error fetching data:", error);
+            }
+        }
+
+        function updateGraphs(datasets) {
+            // Extraer datos de los datasets
+            let irradiance = [];
+            let power = [];
+            let voltage_dc = [];
+            let temperature = [];
+            let wind_speed = [];
+            let timestamps = [];
+
+            if (datasets.irradiance) {
+                datasets.irradiance.data.forEach(entry => {
+                    irradiance.push(entry.poa_irradiance_o_149574);
+                    timestamps.push(entry.measured_on);
+                });
+            }
+
+            if (datasets.electrical) {
+                datasets.electrical.data.forEach(entry => {
+                    power.push(entry.inv_01_ac_power_inv_149583);
+                    voltage_dc.push(entry.inv_01_dc_voltage_inv_149580);
+                });
+            }
+
+            if (datasets.environment) {
+                datasets.environment.data.forEach(entry => {
+                    temperature.push(entry.ambient_temperature_o_149575);
+                    wind_speed.push(entry.wind_speed_o_149576);
+                });
+            }
+
+            // Gráfico de Irradiancia vs Potencia Generada
+            Plotly.newPlot("irradiance-power-graph", [{
+                x: irradiance,
+                y: power,
+                mode: "markers",
+                type: "scatter",
+                marker: { size: 8 },
+                hoverinfo: "x+y",
+                name: "Irradiancia vs Potencia"
+            }], { title: "Irradiancia vs Potencia Generada", xaxis: { title: "Irradiancia (W/m²)" }, yaxis: { title: "Potencia AC (W)" } });
+
+            // Histograma de Voltaje DC
+            Plotly.newPlot("dc-voltage-histogram", [{
+                x: voltage_dc,
+                type: "histogram",
+                marker: { color: "blue" },
+                hoverinfo: "x+y",
+                name: "Voltaje DC"
+            }], { title: "Histograma de Voltaje DC", xaxis: { title: "Voltaje DC (V)" }, yaxis: { title: "Frecuencia" } });
+
+            // Gráfico de Temperatura vs Potencia Generada
+            Plotly.newPlot("temperature-power-graph", [{
+                x: temperature,
+                y: power,
+                mode: "markers",
+                type: "scatter",
+                marker: { size: 8 },
+                hoverinfo: "x+y",
+                name: "Temperatura vs Potencia"
+            }], { title: "Temperatura vs Potencia Generada", xaxis: { title: "Temperatura (°C)" }, yaxis: { title: "Potencia AC (W)" } });
+
+            // Gráfico de Velocidad del Viento vs Temperatura
+            Plotly.newPlot("wind-temperature-graph", [{
+                x: wind_speed,
+                y: temperature,
+                mode: "markers",
+                type: "scatter",
+                marker: { size: 8 },
+                hoverinfo: "x+y",
+                name: "Viento vs Temperatura"
+            }], { title: "Efecto del Viento en la Temperatura", xaxis: { title: "Velocidad del Viento (m/s)" }, yaxis: { title: "Temperatura (°C)" } });
+
+            // Comparación de Energía Generada por Hora del Día
+            let hourlyData = {};
+            timestamps.forEach((time, index) => {
+                let hour = new Date(time).getHours();
+                if (!hourlyData[hour]) {
+                    hourlyData[hour] = [];
+                }
+                hourlyData[hour].push(power[index]);
+            });
+
+            let hours = Object.keys(hourlyData);
+            let avgPower = hours.map(h => {
+                let values = hourlyData[h];
+                return values.reduce((a, b) => a + b, 0) / values.length;
+            });
+
+            Plotly.newPlot("energy-hourly-graph", [{
+                x: hours,
+                y: avgPower,
+                type: "bar",
+                marker: { color: "green" },
+                hoverinfo: "x+y",
+                name: "Energía por Hora"
+            }], { title: "Comparación de Energía Generada por Hora", xaxis: { title: "Hora del Día" }, yaxis: { title: "Potencia Media (W)" } });
+        }
+
+        // Actualización automática cada 30 segundos
+        setInterval(fetchData, 30000);
+
+        // Cargar datos inicialmente
+        fetchData();
+    </script>
+</body>
+</html>

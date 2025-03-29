@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard de Datos</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f0f2f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        select {
+            padding: 8px;
+            margin: 10px 0;
+            width: 200px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Dashboard de Datos en Tiempo Real</h1>
+        
+        <div class="card">
+            <h2>Datos Actuales</h2>
+            <div class="status-bar">
+                Última actualización: <span id="last-update">Nunca</span>
+                <button onclick="toggleAutoUpdate()" id="auto-update-btn">Detener Auto-actualización</button>
+            </div>
+            <div id="current-data"></div>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h2>Distribución de Datos</h2>
+                <select id="dataset-select">
+                    <option value="">Seleccione un dataset</option>
+                </select>
+                <select id="variable-select">
+                    <option value="">Seleccione una variable</option>
+                </select>
+                <div id="histogram"></div>
+            </div>
+
+            <div class="card">
+                <h2>Resumen de Anomalías</h2>
+                <select id="anomaly-dataset-select">
+                    <option value="">Seleccione un dataset</option>
+                </select>
+                <div id="anomalies-summary"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'http://localhost:8000';
+        let autoUpdateInterval;
+        let isAutoUpdateEnabled = true;
+        const UPDATE_INTERVAL = 1000; // 🔥 Actualización cada 1 segundo
+
+        function toggleAutoUpdate() {
+            const btn = document.getElementById('auto-update-btn');
+            if (isAutoUpdateEnabled) {
+                clearInterval(autoUpdateInterval);
+                btn.textContent = 'Iniciar Auto-actualización';
+                isAutoUpdateEnabled = false;
+            } else {
+                startAutoUpdate();
+                btn.textContent = 'Detener Auto-actualización';
+                isAutoUpdateEnabled = true;
+            }
+        }
+
+        async function updateDashboard() {
+            await getCurrentData();
+            document.getElementById('last-update').textContent = new Date().toLocaleString();
+        }
+
+        function startAutoUpdate() {
+            updateDashboard();
+            autoUpdateInterval = setInterval(updateDashboard, UPDATE_INTERVAL);
+        }
+
+        async function loadDatasets() {
+            try {
+                const response = await fetch(`${API_URL}/datasets`);
+                const data = await response.json();
+                
+                const datasetSelects = document.querySelectorAll('#dataset-select, #anomaly-dataset-select');
+                datasetSelects.forEach(select => {
+                    select.innerHTML = '<option value="">Seleccione un dataset</option>';
+                    data.datasets.forEach(dataset => {
+                        const option = document.createElement('option');
+                        option.value = dataset;
+                        option.textContent = dataset;
+                        select.appendChild(option);
+                    });
+                });
+            } catch (error) {
+                console.error('Error cargando datasets:', error);
+            }
+        }
+
+        async function getCurrentData() {
+            try {
+                const response = await fetch(`${API_URL}/current-time-data`);
+                const data = await response.json();
+                
+                const container = document.getElementById('current-data');
+                container.innerHTML = '';
+
+                if (Object.keys(data.datasets).length === 0) {
+                    container.innerHTML = '<p>No hay datos disponibles en este momento.</p>';
+                    return;
+                }
+
+                Object.entries(data.datasets).forEach(([dataset, datasetData]) => {
+                    const datasetCard = document.createElement('div');
+                    datasetCard.classList.add('card');
+                    datasetCard.innerHTML = `<h3>${dataset}</h3>`;
+
+                    datasetData.data.forEach(entry => {
+                        const entryDiv = document.createElement('div');
+                        entryDiv.innerHTML = `<pre>${JSON.stringify(entry, null, 2)}</pre>`;
+                        datasetCard.appendChild(entryDiv);
+                    });
+
+                    container.appendChild(datasetCard);
+                });
+            } catch (error) {
+                console.error('Error obteniendo datos actuales:', error);
+            }
+        }
+
+        document.getElementById('dataset-select').addEventListener('change', async (e) => {
+            if (e.target.value) {
+                const response = await fetch(`${API_URL}/data-distribution/${e.target.value}/wind_speed_o_149576`);
+                const data = await response.json();
+                
+                const variableSelect = document.getElementById('variable-select');
+                variableSelect.innerHTML = '<option value="">Seleccione una variable</option>';
+                
+                Object.keys(data.statistics).forEach(variable => {
+                    const option = document.createElement('option');
+                    option.value = variable;
+                    option.textContent = variable;
+                    variableSelect.appendChild(option);
+                });
+            }
+        });
+
+        async function init() {
+            await loadDatasets();
+            startAutoUpdate();
+        }
+
+        init();
+    </script>
+</body>
+</html>

@@ -1,0 +1,154 @@
+import streamlit as st
+import requests
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+
+st.set_page_config(page_title="Dashboard de Análisis", layout="wide")
+st.title("📊 Dashboard de Exploración y Análisis de Anomalías")
+
+BASE_URL = "http://localhost:8000"
+
+@st.cache_data(ttl=10)
+def fetch_json(endpoint):
+    try:
+        response = requests.get(f"{BASE_URL}{endpoint}")
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"Error {response.status_code} al consultar {endpoint}")
+            return None
+    except Exception as e:
+        st.error(f"Error al conectar con la API: {e}")
+        return None
+
+# --- Sidebar ---
+st.sidebar.header("Opciones")
+seccion = st.sidebar.radio("Selecciona sección", [
+    "📈 Tiempo Real", "📊 Distribución", "🔗 Correlación", "⚖️ Dispersión", 
+    "📉 Histórico", "🚨 Anomalías Detalladas", "📅 Análisis Diario", "📆 Comparar Días"])
+
+# Obtener datasets disponibles
+current_data = fetch_json("/current-time-data")
+dataset_names = list(current_data.get("datasets", {}).keys()) if current_data else []
+
+# --- Sección: Tiempo Real ---
+if seccion == "📈 Tiempo Real":
+    st.subheader("📈 Datos en Tiempo Real")
+    for ds in dataset_names:
+        st.markdown(f"### Dataset: `{ds}`")
+        df = pd.DataFrame(current_data["datasets"][ds]["data"])
+        if df.empty: continue
+
+        numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
+        if 'month' in df:
+            df["timestamp"] = pd.to_datetime({
+                "year": int(current_data["timestamp"][:4]),
+                "month": df["month"],
+                "day": df["day"],
+                "hour": df["hour"],
+                "minute": df["minute"]
+            })
+        else:
+            df["timestamp"] = pd.to_datetime(current_data["timestamp"])
+
+        for col in numeric_cols:
+            fig = px.line(df, x="timestamp", y=col, markers=True, title=f"{col}")
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("⚠️ Resumen de Anomalías")
+    anomaly_df = pd.DataFrame(current_data.get("anomaly_summary", {}).items(), columns=["Dataset", "Total"])
+    st.plotly_chart(px.bar(anomaly_df, x="Dataset", y="Total", color="Dataset"), use_container_width=True)
+
+# --- Sección: Distribución ---
+elif seccion == "📊 Distribución":
+    ds = st.selectbox("Selecciona Dataset", dataset_names)
+    if ds:
+        df = pd.DataFrame(current_data["datasets"][ds]["data"])
+        numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
+        variable = st.selectbox("Variable", numeric_cols)
+        if variable:
+            dist_data = fetch_json(f"/data-distribution/{ds}/{variable}")
+            if dist_data:
+                fig = go.Figure(data=[go.Bar(x=dist_data["histogram"]["bins"], y=dist_data["histogram"]["counts"])])
+                fig.update_layout(title=f"Distribución de {variable}")
+                st.plotly_chart(fig, use_container_width=True)
+
+# --- Sección: Correlación ---
+elif seccion == "🔗 Correlación":
+    ds = st.selectbox("Dataset para correlación", dataset_names)
+    if ds:
+        corr = fetch_json(f"/correlation/{ds}")
+        if corr:
+            corr_df = pd.DataFrame(corr["correlation_matrix"])
+            fig = px.imshow(corr_df, text_auto=True, aspect="auto", title="Matriz de Correlación")
+            st.plotly_chart(fig, use_container_width=True)
+
+# --- Sección: Dispersión ---
+elif seccion == "⚖️ Dispersión":
+    ds = st.selectbox("Dataset para dispersión", dataset_names)
+    if ds:
+        df = pd.DataFrame(current_data["datasets"][ds]["data"])
+        numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
+        var_x = st.selectbox("Variable X", numeric_cols)
+        var_y = st.selectbox("Variable Y", numeric_cols)
+        if var_x and var_y:
+            scatter = fetch_json(f"/scatter/{ds}/{var_x}/{var_y}")
+            if scatter:
+                sdf = pd.DataFrame(scatter["data"])
+                fig = px.scatter(sdf, x=var_x, y=var_y, title=f"{var_x} vs {var_y}")
+                st.plotly_chart(fig, use_container_width=True)
+
+# --- Sección: Histórico ---
+elif seccion == "📉 Histórico":
+    ds = st.selectbox("Dataset histórico", dataset_names)
+    if ds:
+        df = pd.DataFrame(current_data["datasets"][ds]["data"])
+        numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
+        variable = st.selectbox("Variable", numeric_cols)
+        if variable:
+            history = fetch_json(f"/historical-data/{ds}/{variable}?limit=200")
+            if history:
+                hist_df = pd.DataFrame(history["data"])
+                fig = px.line(hist_df, x="measured_on", y=variable, title=f"Histórico de {variable}")
+                st.plotly_chart(fig, use_container_width=True)
+
+# --- Sección: Análisis Detallado ---
+elif seccion == "🚨 Anomalías Detalladas":
+    ds = st.selectbox("Dataset para ver anomalías", dataset_names)
+    if ds:
+        details = fetch_json(f"/detailed-anomalies/{ds}")
+        if details:
+            for var, rows in details["anomalies"].items():
+                if rows:
+                    st.markdown(f"### 🔴 Anomalías en `{var}`")
+                    st.dataframe(pd.DataFrame(rows))
+
+# --- Sección: Análisis Diario ---
+elif seccion == "📅 Análisis Diario":
+    st.subheader("Análisis del Día Anterior")
+    analysis = fetch_json("/daily-analysis")
+    if analysis:
+        for ds, stats in analysis["daily_analysis"].items():
+            st.markdown(f"### Dataset: `{ds}`")
+            st.write("📊 Anomalías:", stats["anomalies_detected"])
+            st.write("⚡ Cambios Repentinos:", stats["sudden_changes_detected"])
+
+# --- Sección: Comparación ---
+elif seccion == "📆 Comparar Días":
+    st.subheader("Comparar Días Analizados")
+    comp = fetch_json("/compare-analyses")
+    if comp:
+        for ds in dataset_names:
+            fechas, anom, cambios = [], [], []
+            for item in comp["comparison"]:
+                if ds in item["datasets"]:
+                    fechas.append(item["date"])
+                    anom.append(item["datasets"][ds]["total_anomalies"])
+                    cambios.append(item["datasets"][ds]["sudden_changes"])
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=fechas, y=anom, mode='lines+markers', name='Anomalías'))
+            fig.add_trace(go.Scatter(x=fechas, y=cambios, mode='lines+markers', name='Cambios Repentinos'))
+            fig.update_layout(title=f"Evolución de {ds}", xaxis_title="Fecha", yaxis_title="Cantidad")
+            st.plotly_chart(fig, use_container_width=True)
