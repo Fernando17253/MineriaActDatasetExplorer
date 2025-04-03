@@ -372,18 +372,61 @@ async def energy_by_hour():
         df_hourly = df_power.resample("H").sum()
         df_hourly = df_hourly.replace([np.inf, -np.inf], np.nan).dropna()
 
+        now = datetime.now()
+        rounded_now = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+        expected_time_str = rounded_now.strftime("%Y-%m-%d %H:%M:%S")
+
+        has_data_now = not df_hourly.loc[df_hourly.index <= rounded_now].empty
+        alert = None
+        if not has_data_now and 6 <= rounded_now.hour <= 18:
+            alert = f"⚠️ No se detectaron datos de energía para el horario esperado ({expected_time_str})."
+
+        def categorize_hour(hour):
+            if 6 <= hour < 12:
+                return "morning"
+            elif 12 <= hour < 18:
+                return "afternoon"
+            elif 18 <= hour < 24:
+                return "evening"
+            else:
+                return "night"
+
+        df_hourly["hour"] = df_hourly.index.hour
+        df_hourly["hour_label"] = df_hourly.index.strftime("%H:00")
+        df_hourly["time_slot"] = df_hourly.index.hour.map(categorize_hour)
+
+        time_slot_summary = df_hourly.groupby("time_slot")["total_power"].sum().to_dict()
+
+        max_hour = df_hourly["total_power"].idxmax()
+        min_hour = df_hourly["total_power"].idxmin()
+
+        extremes = {
+            "highest_hour": {
+                "hour": max_hour.strftime("%H:00"),
+                "energy": float(df_hourly.loc[max_hour, "total_power"])
+            },
+            "lowest_hour": {
+                "hour": min_hour.strftime("%H:00"),
+                "energy": float(df_hourly.loc[min_hour, "total_power"])
+            }
+        }
+
         result = [
             {
-                "hour": ts.strftime("%H:00"),
+                "hour": row["hour_label"],
                 "energy_generated": float(row["total_power"])
             }
-            for ts, row in df_hourly.iterrows()
+            for _, row in df_hourly.iterrows()
         ]
 
         return {
             "graph_type": "bar",
             "description": "Comparación de Energía Generada en Diferentes Horas del Día",
-            "data": result
+            "data": result,
+            "expected_time": expected_time_str,
+            "alert": alert,
+            "time_slot_summary": time_slot_summary,
+            "extremes": extremes
         }
 
     except Exception as e:
