@@ -2,11 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
-import json
-import glob
-from fastapi import Query
 
 app = FastAPI()
 
@@ -26,363 +23,368 @@ csv_files = {
     "irradiance": "2107_irradiance_data.csv",
 }
 
-# Variable global para almacenar los últimos datos válidos
-last_sent_data = {"timestamp": None, "datasets": {}}
-
-# Configuración de horario nocturno
-NIGHT_START = 19  # 19:00 (7 PM)
-NIGHT_END = 7     # 07:00 (7 AM)
-
-# Función para cargar y limpiar los datasets
+# Función para cargar y limpiar los datasets (día y mes actual, primer año válido)
 def load_and_clean_data(file_path):
     if not os.path.exists(file_path):
         print(f"❌ Archivo no encontrado: {file_path}")
         return None
-    
+
     df = pd.read_csv(file_path)
 
-    # Convertir la columna de fecha a datetime
-    if "measured_on" in df.columns:
-        df["measured_on"] = pd.to_datetime(df["measured_on"])
-        df.set_index("measured_on", inplace=True)
-
-        # Filtrar solo registros del mismo día y mes actual
-        today = datetime.now()
-        filtered_df = df[(df.index.month == today.month) & (df.index.day == today.day)]
-        
-        if filtered_df.empty:
-            print(f"⚠️ No hay registros en el mismo mes y día para {file_path}")
-            return None
-
-        # Obtener el primer año disponible con registros en el día y mes actual
-        first_year = filtered_df.index.year.min()
-        df = df[df.index.year == first_year]
-
-        # Rellenar valores faltantes con forward fill y backward fill
-        df.fillna(method='ffill', inplace=True)
-        df.fillna(method='bfill', inplace=True)
-
-        return df
-    else:
+    if "measured_on" not in df.columns:
         print(f"⚠️ No se encontró la columna 'measured_on' en {file_path}")
         return None
 
-# Cargar los datasets asegurando que solo se tome el primer año con registros en el mismo día y mes
-datasets = {name: load_and_clean_data(path) for name, path in csv_files.items()}
+    df["measured_on"] = pd.to_datetime(df["measured_on"])
+    df.set_index("measured_on", inplace=True)
 
-# Función para detectar anomalías con el método IQR
-def detectar_anomalias_iqr(df, col):
-    Q1 = np.percentile(df[col].dropna(), 25)
-    Q3 = np.percentile(df[col].dropna(), 75)
-    IQR = Q3 - Q1
-    limite_inferior = Q1 - 1.5 * IQR
-    limite_superior = Q3 + 1.5 * IQR
-    return df[(df[col] < limite_inferior) | (df[col] > limite_superior)]
-
-def get_last_16_records(df):
-    df = df.copy()
-
-    # Extraer fecha y hora del índice
-    df["month"] = df.index.month
-    df["day"] = df.index.day
-    df["hour"] = df.index.hour
-    df["minute"] = df.index.minute
-    df["year"] = df.index.year
-
-    # Filtrar registros del mismo día y mes
     today = datetime.now()
-    df_filtered = df[
-        (df["month"] == today.month) &
-        (df["day"] == today.day) &
-        ((df.index.hour < today.hour) | 
-         ((df.index.hour == today.hour) & (df.index.minute <= today.minute)))
-    ]
+    day = today.day
+    month = today.month
 
-    if df_filtered.empty:
+    # Buscar el primer año que tenga datos para este mes y día
+    available_years = sorted(df.index.year.unique())
+    filtered_df = None
+
+    for year in available_years:
+        subset = df[(df.index.year == year) & (df.index.month == month) & (df.index.day == day)]
+        if not subset.empty:
+            filtered_df = subset
+            break
+
+    if filtered_df is None:
+        print(f"⚠️ No se encontraron registros para el {day}/{month} en ningún año.")
         return None
 
-    # Asegurar que los datos sean cada 5 minutos
-    df_filtered = df_filtered[df_filtered["minute"] % 5 == 0]
+    # Limpiar valores faltantes
+    filtered_df = filtered_df.copy()
+    filtered_df.fillna(method='ffill', inplace=True)
+    filtered_df.fillna(method='bfill', inplace=True)
 
-    # Ordenar de forma descendente y tomar los últimos 16 registros
-    past_records = df_filtered.sort_index(ascending=False).iloc[:16]
+    return filtered_df
 
-    return past_records if not past_records.empty else None
+# Cargar los datasets al iniciar
+datasets = {name: load_and_clean_data(path) for name, path in csv_files.items()}
 
-@app.get("/current-time-data")
-async def get_real_time_data():
+@app.get("/irradiance-vs-power")
+async def get_irradiance_vs_power():
     """
-    Obtiene los últimos 16 registros basados en el último dato encontrado.
-    Si no hay datos exactos, busca los más cercanos anteriores con intervalos de 5 minutos.
-    Verifica si los datos entre los datasets coinciden y genera un resumen de anomalías.
+    Relaciona la irradiancia con la potencia generada por los inversores.
+    Devuelve puntos para graficar irradiancia vs potencia total.
+    También detecta si hay desconexión de sensores por falta de datos recientes.
     """
-    global last_sent_data
-    current_time = datetime.now()
-    current_hour = current_time.hour
-    new_data = {
-        "timestamp": current_time.isoformat(),
-        "datasets": {},
-        "is_anomalous": False,
-        "anomaly_summary": {}
-    }
+    if "irradiance" not in datasets or "electrical" not in datasets:
+        return {"error": "No se encontraron los datasets necesarios"}
 
-    has_new_data = False
-    dataset_timestamps = {}
+    df_irr = datasets["irradiance"]
+    df_elec = datasets["electrical"]
 
-    for dataset_name, df in datasets.items():
-        if df is not None:
-            nearest_data = get_last_16_records(df)
-            if nearest_data is not None and not nearest_data.empty:
-                nearest_data = nearest_data.replace([np.inf, -np.inf], np.nan).fillna(0)
+    if df_irr is None or df_elec is None:
+        return {"error": "Datasets vacíos"}
 
-                anomalies = {}
-                total_anomalies = 0  # Para el resumen de anomalías
+    try:
+        # Redondear la hora actual a múltiplos de 5 minutos
+        now = datetime.now()
+        rounded_now = now.replace(
+            minute=(now.minute // 5) * 5,
+            second=0,
+            microsecond=0
+        )
 
-                for col in nearest_data.columns:
-                    anomaly_data = detectar_anomalias_iqr(nearest_data, col)
-                    anomalies[col] = len(anomaly_data)
-                    total_anomalies += len(anomaly_data)
+        expected_time_str = rounded_now.strftime("%Y-%m-%d %H:%M:%S")
 
-                # Guardar timestamp para verificar coherencia
-                dataset_timestamps[dataset_name] = nearest_data.index[0]
+        # Seleccionar columna de irradiancia
+        irradiance_col = "poa_irradiance_o_149574"
+        df_irr_sel = df_irr[[irradiance_col]].copy()
 
-                new_data["datasets"][dataset_name] = {
-                    "data": nearest_data.to_dict(orient="records"),
-                    "anomalies": anomalies
-                }
+        # Seleccionar columnas de potencia AC en electrical
+        power_cols = [col for col in df_elec.columns if "ac_power" in col]
+        df_power_sel = df_elec[power_cols].copy()
+        df_power_sel["total_power"] = df_power_sel.sum(axis=1)
 
-                # Agregar al resumen de anomalías
-                new_data["anomaly_summary"][dataset_name] = total_anomalies
+        # Unir ambos datasets por el índice (tiempo)
+        combined = pd.merge(
+            df_irr_sel,
+            df_power_sel[["total_power"]],
+            left_index=True,
+            right_index=True
+        )
+        combined = combined.replace([np.inf, -np.inf], np.nan).dropna()
 
-                has_new_data = True
+        # Verificar si hay datos para el tiempo actual redondeado
+        has_current_data = rounded_now in combined.index
+        alert = None
+        if not has_current_data and 6 <= rounded_now.hour <= 18:
+            alert = f"⚠️ No hay datos para el horario esperado ({expected_time_str}). Posible desconexión del sensor."
 
-    # Verificar coherencia entre datasets
-    unique_timestamps = set(dataset_timestamps.values())
-
-    # Si los datasets tienen timestamps diferentes, revisar si es de noche
-    if len(unique_timestamps) > 1:
-        if current_hour >= NIGHT_START or current_hour < NIGHT_END:
-            # Si es de noche, permitir que irradiance y electrical no tengan datos sin marcarlos como anómalos
-            if "irradiance" in dataset_timestamps:
-                del dataset_timestamps["irradiance"]
-            if "electrical" in dataset_timestamps:
-                del dataset_timestamps["electrical"]
-
-            unique_timestamps = set(dataset_timestamps.values())
-
-        # Si aún hay diferencias en los timestamps, marcar como anómalo
-        if len(unique_timestamps) > 1:
-            new_data["is_anomalous"] = True
-
-    if has_new_data:
-        last_sent_data = new_data
-    else:
-        new_data = last_sent_data
-
-    return new_data
-
-@app.get("/historical-data/{dataset_name}/{variable}")
-async def get_historical_data(dataset_name: str, variable: str, limit: int = 5):
-    """ Devuelve los últimos 'n' datos históricos de una variable en un dataset """
-    if dataset_name not in datasets or datasets[dataset_name] is None:
-        return {"error": "Dataset no encontrado"}
-    
-    df = datasets[dataset_name]
-    
-    if variable not in df.columns:
-        return {"error": "Variable no encontrada en el dataset"}
-
-    historical_data = df[[variable]].dropna().tail(limit).reset_index()
-    
-    return {"dataset": dataset_name, "variable": variable, "data": historical_data.to_dict(orient="records")}
-
-@app.get("/correlation/{dataset_name}")
-async def get_correlation_matrix(dataset_name: str):
-    """ Devuelve la matriz de correlación entre variables numéricas en un dataset """
-    if dataset_name not in datasets or datasets[dataset_name] is None:
-        return {"error": "Dataset no encontrado"}
-
-    df = datasets[dataset_name].select_dtypes(include=[np.number])  # Solo variables numéricas
-    correlation_matrix = df.corr().fillna(0).to_dict()
-
-    return {"dataset": dataset_name, "correlation_matrix": correlation_matrix}
-
-@app.get("/scatter/{dataset_name}/{var_x}/{var_y}")
-async def get_scatter_data(dataset_name: str, var_x: str, var_y: str, limit: int = 100):
-    """ Devuelve datos de dos variables para hacer un scatter plot """
-    if dataset_name not in datasets or datasets[dataset_name] is None:
-        return {"error": "Dataset no encontrado"}
-
-    df = datasets[dataset_name]
-    
-    if var_x not in df.columns or var_y not in df.columns:
-        return {"error": "Una o ambas variables no existen en el dataset"}
-
-    scatter_data = df[[var_x, var_y]].dropna().tail(limit).reset_index()
-
-    return {"dataset": dataset_name, "variables": [var_x, var_y], "data": scatter_data.to_dict(orient="records")}
-
-
-
-@app.get("/detailed-anomalies/{dataset_name}")
-async def get_detailed_anomalies(dataset_name: str):
-    """ Devuelve los valores de las anomalías detectadas en el dataset """
-    if dataset_name not in datasets or datasets[dataset_name] is None:
-        return {"error": "Dataset no encontrado"}
-
-    df = datasets[dataset_name]
-    anomalies = {}
-
-    for col in df.select_dtypes(include=[np.number]).columns:
-        outliers = detectar_anomalias_iqr(df, col)
-        anomalies[col] = outliers.to_dict(orient="records") if not outliers.empty else []
-
-    return {"dataset": dataset_name, "anomalies": anomalies}
-
-@app.get("/data-distribution/{dataset_name}/{variable}")
-async def get_data_distribution(dataset_name: str, variable: str):
-    """Distribución de datos con búsqueda de datos más cercanos"""
-    if dataset_name not in datasets or datasets[dataset_name] is None:
-        return {"error": "Dataset no encontrado"}
-
-    df = datasets[dataset_name]
-    current_time = datetime.now()
-    
-    nearest_data = get_nearest_time_data(df, current_time)
-    
-    if nearest_data is None or nearest_data.empty:
-        return {"message": "No hay datos disponibles para la distribución en este tiempo"}
-
-    nearest_data = nearest_data.replace([np.inf, -np.inf], np.nan).fillna(0)
-
-    hist, bin_edges = np.histogram(nearest_data[variable].dropna(), bins=50)
-
-    return {
-        "variable": variable,
-        "histogram": {
-            "bins": bin_edges.tolist(),
-            "counts": hist.tolist()
-        },
-        "statistics": {
-            "mean": float(nearest_data[variable].mean()),
-            "std": float(nearest_data[variable].std()),
-            "min": float(nearest_data[variable].min()),
-            "max": float(nearest_data[variable].max())
-        }
-    }
-
-
-@app.get("/daily-analysis")
-async def get_daily_analysis():
-    """
-    Analiza los datos del día anterior, guarda el análisis como archivo JSON
-    y elimina el más antiguo si hay más de 5.
-    """
-    records_per_day = 288  # 5 minutos de intervalo durante 24h
-    analysis_result = {}
-
-    day_to_analyze = datetime.now() - timedelta(days=1)
-    month = day_to_analyze.month
-    day = day_to_analyze.day
-
-    for dataset_name, df in datasets.items():
-        if df is None or df.empty:
-            continue
-
-        df_clean = df.copy().replace([np.inf, -np.inf], np.nan).fillna(0)
-        df_filtered = df_clean[(df_clean.index.month == month) & (df_clean.index.day == day)]
-        df_filtered = df_filtered[df_filtered.index.minute % 5 == 0]
-        df_filtered = df_filtered.sort_index(ascending=False).iloc[:records_per_day].sort_index()
-
-        if df_filtered.empty:
-            continue
-
-        anomalies_summary = {}
-        sudden_changes = {}
-
-        for col in df_filtered.columns:
-            iqr_anomalies = detectar_anomalias_iqr(df_filtered, col)
-            anomalies_summary[col] = len(iqr_anomalies)
-
-            diff = df_filtered[col].diff().abs()
-            sudden_peaks = diff[diff > diff.mean() + 3 * diff.std()]
-            sudden_changes[col] = {
-                "count": int(sudden_peaks.count()),
-                "max_jump": float(sudden_peaks.max()) if not sudden_peaks.empty else 0.0
+        # Formatear datos
+        result = [
+            {
+                "timestamp": ts.isoformat(),
+                "irradiance": float(row[irradiance_col]),
+                "total_power": float(row["total_power"])
             }
+            for ts, row in combined.iterrows()
+        ]
 
-        analysis_result[dataset_name] = {
-            "date_analyzed": day_to_analyze.strftime("%Y-%m-%d"),
-            "total_records_analyzed": len(df_filtered),
-            "anomalies_detected": anomalies_summary,
-            "sudden_changes_detected": sudden_changes
+        return {
+            "graph_type": "scatter",
+            "description": "Relación entre Irradiancia (W/m²) y Potencia Generada (W)",
+            "data": result,
+            "expected_time": expected_time_str,
+            "alert": alert
         }
 
-    # Guardar el archivo
-    analysis_dir = "analyses"
-    os.makedirs(analysis_dir, exist_ok=True)
-    file_name = f"analysis_{day_to_analyze.strftime('%Y-%m-%d')}.json"
-    file_path = os.path.join(analysis_dir, file_name)
+    except Exception as e:
+        return {"error": f"Error al procesar los datos: {str(e)}"}
 
-    # Eliminar archivos antiguos si hay más de 5
-    existing_files = sorted(glob.glob(os.path.join(analysis_dir, "analysis_*.json")))
-    if len(existing_files) >= 5:
-        os.remove(existing_files[0])  # Elimina el más antiguo
+@app.get("/histogram/{measurement_type}")
+async def get_voltage_current_histogram(measurement_type: str):
+    valid_types = ["voltage", "current"]
+    if measurement_type not in valid_types:
+        return {"error": f"Tipo no válido. Usa uno de: {valid_types}"}
 
-    with open(file_path, "w") as f:
-        json.dump({"daily_analysis": analysis_result}, f, indent=4)
+    df_elec = datasets.get("electrical")
+    if df_elec is None:
+        return {"error": "Dataset 'electrical' no disponible"}
 
-    return {"daily_analysis": analysis_result}
+    try:
+        if measurement_type == "voltage":
+            cols = [c for c in df_elec.columns if "ac_voltage" in c]
+        else:
+            cols = [c for c in df_elec.columns if "ac_current" in c]
 
+        if not cols:
+            return {"error": f"No se encontraron columnas para {measurement_type}"}
 
-@app.get("/get-analysis")
-async def get_saved_analysis(date: str = Query(..., description="Formato: YYYY-MM-DD")):
+        df_filtered = df_elec[cols].copy()
+        df_filtered = df_filtered.replace([np.inf, -np.inf], np.nan).dropna()
+
+        all_values = df_filtered.values.flatten()
+
+        now = datetime.now()
+        rounded_now = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+        expected_time_str = rounded_now.strftime("%Y-%m-%d %H:%M:%S")
+        # Buscar el dato más cercano hacia atrás dentro de un margen
+        closest_record = df_filtered.loc[df_filtered.index <= rounded_now]
+        has_data_now = not closest_record.empty
+        alert = None
+
+        if not has_data_now and 6 <= rounded_now.hour <= 18:
+            alert = f"⚠️ No se detectaron datos recientes de {measurement_type} para el horario esperado ({expected_time_str})."
+
+        hist, bin_edges = np.histogram(all_values, bins=50)
+
+        bins_labels = [f"Bin {i+1} ({round(bin_edges[i], 2)} - {round(bin_edges[i+1], 2)})" for i in range(len(bin_edges)-1)]
+
+        # Agrupación por franja horaria
+        def categorize_hour(hour):
+            if 6 <= hour < 12:
+                return "morning"
+            elif 12 <= hour < 18:
+                return "afternoon"
+            elif 18 <= hour < 24:
+                return "evening"
+            else:
+                return "night"
+
+        time_distribution = df_filtered.copy()
+        time_distribution["hour_group"] = df_filtered.index.hour.map(categorize_hour)
+        hour_counts = time_distribution["hour_group"].value_counts().to_dict()
+
+        max_inverter = df_filtered.mean().idxmax()
+        min_inverter = df_filtered.mean().idxmin()
+
+        extremes = {
+            "highest": {"inverter": max_inverter, "value": float(df_filtered[max_inverter].mean())},
+            "lowest": {"inverter": min_inverter, "value": float(df_filtered[min_inverter].mean())}
+        }
+
+        return {
+            "graph_type": "histogram",
+            "measurement_type": measurement_type,
+            "description": f"Distribución de {'Voltaje' if measurement_type == 'voltage' else 'Corriente'} AC (todos los inversores)",
+            "bins": bins_labels,
+            "counts": hist.tolist(),
+            "expected_time": expected_time_str,
+            "alert": alert,
+            "time_distribution": hour_counts,
+            "extremes": extremes
+        }
+
+    except Exception as e:
+        return {"error": f"Error al procesar el histograma: {str(e)}"}
+
+@app.get("/temperature-vs-power")
+async def get_temperature_vs_power():
+    df_temp = datasets.get("environment")
+    df_power = datasets.get("electrical")
+
+    if df_temp is None or df_power is None:
+        return {"error": "Faltan datasets de environment o electrical"}
+
+    try:
+        temp_col = "ambient_temperature_o_149575"
+        power_cols = [col for col in df_power.columns if "ac_power" in col]
+        
+        df_temp_sel = df_temp[[temp_col]].copy()
+        df_power_sel = df_power[power_cols].copy()
+        df_power_sel["total_power"] = df_power_sel.sum(axis=1)
+
+        combined = pd.merge(df_temp_sel, df_power_sel[["total_power"]], left_index=True, right_index=True)
+        combined = combined.replace([np.inf, -np.inf], np.nan).dropna()
+
+        now = datetime.now()
+        rounded_now = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+        expected_time_str = rounded_now.strftime("%Y-%m-%d %H:%M:%S")
+        closest_record = combined.loc[combined.index <= rounded_now]
+        has_data_now = not closest_record.empty
+        alert = None
+
+        if not has_data_now and 6 <= rounded_now.hour <= 18:
+            alert = f"⚠️ No hay datos para la hora esperada ({expected_time_str}). Posible desconexión de sensores."
+
+        combined["time_slot"] = combined.index.hour.map(
+            lambda h: "morning" if 6 <= h < 12 else "afternoon" if 12 <= h < 18 else "evening" if 18 <= h < 24 else "night")
+        time_slot_summary = combined.groupby("time_slot").size().to_dict()
+
+        result = [
+            {
+                "timestamp": ts.isoformat(),
+                "temperature": float(row[temp_col]),
+                "total_power": float(row["total_power"])
+            } for ts, row in combined.iterrows()
+        ]
+
+        return {
+            "graph_type": "scatter",
+            "description": "Relación entre Temperatura Ambiente (°C) y Potencia Generada (W)",
+            "data": result,
+            "time_slot_summary": time_slot_summary,
+            "expected_time": expected_time_str,
+            "alert": alert
+        }
+
+    except Exception as e:
+        return {"error": f"Error al procesar los datos: {str(e)}"}
+
+@app.get("/wind-vs-temperature")
+async def get_wind_vs_temperature():
     """
-    Devuelve el análisis guardado de una fecha específica.
+    Relación entre la velocidad del viento y la temperatura ambiente.
+    Devuelve puntos para graficar viento vs temperatura.
     """
-    file_path = f"analyses/analysis_{date}.json"
-    if not os.path.exists(file_path):
-        return {"error": f"No se encontró el análisis para la fecha {date}"}
-    
-    with open(file_path, "r") as f:
-        analysis = json.load(f)
+    if "environment" not in datasets:
+        return {"error": "Dataset 'environment' no disponible"}
 
-    return analysis
+    df_env = datasets["environment"]
 
-@app.get("/compare-analyses")
-async def compare_saved_analyses():
-    """
-    Compara los análisis guardados (máx 5) y devuelve datos
-    para graficar anomalías y cambios repentinos.
-    """
-    analysis_dir = "analyses"
-    if not os.path.exists(analysis_dir):
-        return {"error": "No se encontraron análisis guardados"}
+    if df_env is None:
+        return {"error": "Datos de entorno no disponibles"}
 
-    analysis_files = sorted(glob.glob(os.path.join(analysis_dir, "analysis_*.json")))
-    if not analysis_files:
-        return {"error": "No hay análisis disponibles"}
+    try:
+        temp_col = "ambient_temperature_o_149575"
+        wind_col = "wind_speed_o_149576"
 
-    comparison_result = []
+        df_selected = df_env[[temp_col, wind_col]].copy()
+        df_selected = df_selected.replace([np.inf, -np.inf], np.nan).dropna()
 
-    for file_path in analysis_files:
-        with open(file_path, "r") as f:
-            data = json.load(f)
-            day_data = {
-                "date": file_path.split("analysis_")[-1].replace(".json", ""),
-                "datasets": {}
+        now = datetime.now()
+        rounded_now = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+        expected_time_str = rounded_now.strftime("%Y-%m-%d %H:%M:%S")
+
+        closest_record = df_selected.loc[df_selected.index <= rounded_now]
+        has_data_now = not closest_record.empty
+        alert = None
+        if not has_data_now:
+            alert = f"⚠️ No hay datos de viento y temperatura para el horario esperado ({expected_time_str})."
+
+        result = [
+            {
+                "timestamp": ts.isoformat(),
+                "temperature": float(row[temp_col]),
+                "wind_speed": float(row[wind_col])
             }
+            for ts, row in df_selected.iterrows()
+        ]
 
-            for dataset_name, values in data["daily_analysis"].items():
-                anomalies_total = sum(values["anomalies_detected"].values())
-                sudden_total = sum(v["count"] for v in values["sudden_changes_detected"].values())
+        return {
+            "graph_type": "line",
+            "description": "Relación entre Velocidad del Viento (m/s) y Temperatura Ambiente (°C)",
+            "data": result,
+            "expected_time": expected_time_str,
+            "alert": alert
+        }
 
-                day_data["datasets"][dataset_name] = {
-                    "total_anomalies": anomalies_total,
-                    "sudden_changes": sudden_total
-                }
+    except Exception as e:
+        return {"error": f"Error al procesar los datos: {str(e)}"}
 
-            comparison_result.append(day_data)
+@app.get("/power-anomalies")
+async def detect_power_anomalies():
+    df_elec = datasets.get("electrical")
+    if df_elec is None:
+        return {"error": "Dataset 'electrical' no disponible"}
 
-    return {"comparison": comparison_result}
+    try:
+        power_cols = [col for col in df_elec.columns if "ac_power" in col]
+        if not power_cols:
+            return {"error": "No se encontraron columnas de potencia"}
 
+        df_power = df_elec[power_cols].copy()
+        df_power = df_power.replace([np.inf, -np.inf], np.nan).dropna()
+
+        anomalies = {}
+        for col in power_cols:
+            Q1 = df_power[col].quantile(0.25)
+            Q3 = df_power[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower = Q1 - 1.5 * IQR
+            upper = Q3 + 1.5 * IQR
+            outliers = df_power[(df_power[col] < lower) | (df_power[col] > upper)]
+            anomalies[col] = outliers.index.strftime("%Y-%m-%d %H:%M:%S").tolist()
+
+        total_anomalies = sum(len(v) for v in anomalies.values())
+
+        return {
+            "graph_type": "line",
+            "description": "Detección de Anomalías en la Potencia de los Inversores",
+            "total_anomalies": total_anomalies,
+            "anomalies": anomalies
+        }
+
+    except Exception as e:
+        return {"error": f"Error al detectar anomalías: {str(e)}"}
+
+@app.get("/energy-by-hour")
+async def energy_by_hour():
+    df_elec = datasets.get("electrical")
+    if df_elec is None:
+        return {"error": "Dataset 'electrical' no disponible"}
+
+    try:
+        power_cols = [col for col in df_elec.columns if "ac_power" in col]
+        if not power_cols:
+            return {"error": "No se encontraron columnas de potencia"}
+
+        df_power = df_elec[power_cols].copy()
+        df_power["total_power"] = df_power.sum(axis=1)
+
+        df_hourly = df_power.resample("H").sum()
+        df_hourly = df_hourly.replace([np.inf, -np.inf], np.nan).dropna()
+
+        result = [
+            {
+                "hour": ts.strftime("%H:00"),
+                "energy_generated": float(row["total_power"])
+            }
+            for ts, row in df_hourly.iterrows()
+        ]
+
+        return {
+            "graph_type": "bar",
+            "description": "Comparación de Energía Generada en Diferentes Horas del Día",
+            "data": result
+        }
+
+    except Exception as e:
+        return {"error": f"Error al calcular la energía por hora: {str(e)}"}

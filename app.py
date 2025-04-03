@@ -34,31 +34,51 @@ dataset_names = list(current_data.get("datasets", {}).keys()) if current_data el
 
 # --- Sección: Tiempo Real ---
 if seccion == "📈 Tiempo Real":
-    st.subheader("📈 Datos en Tiempo Real")
-    for ds in dataset_names:
-        st.markdown(f"### Dataset: `{ds}`")
-        df = pd.DataFrame(current_data["datasets"][ds]["data"])
-        if df.empty: continue
+    st.subheader("📡 Datos en Tiempo Real (últimos 16 registros)")
 
-        numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
-        if 'month' in df:
-            df["timestamp"] = pd.to_datetime({
-                "year": int(current_data["timestamp"][:4]),
-                "month": df["month"],
-                "day": df["day"],
-                "hour": df["hour"],
-                "minute": df["minute"]
-            })
+    selected_ds = st.selectbox("Selecciona un Dataset", dataset_names, key="rt_ds")
+    
+    if selected_ds:
+        rt_df = pd.DataFrame(current_data["datasets"][selected_ds]["data"])
+
+        if rt_df.empty:
+            st.warning("No hay datos disponibles para este dataset.")
         else:
-            df["timestamp"] = pd.to_datetime(current_data["timestamp"])
+            numeric_cols = rt_df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+            selected_var = st.selectbox("Selecciona una Variable", numeric_cols, key="rt_var")
 
-        for col in numeric_cols:
-            fig = px.line(df, x="timestamp", y=col, markers=True, title=f"{col}")
-            st.plotly_chart(fig, use_container_width=True)
+            if 'month' in rt_df.columns:
+                rt_df["timestamp"] = pd.to_datetime({
+                    "year": int(current_data["timestamp"][:4]),
+                    "month": rt_df["month"],
+                    "day": rt_df["day"],
+                    "hour": rt_df["hour"],
+                    "minute": rt_df["minute"]
+                })
+            else:
+                rt_df["timestamp"] = pd.to_datetime(current_data["timestamp"])
 
+            rt_df.sort_values("timestamp", inplace=True)
+
+            st.plotly_chart(
+                px.line(rt_df, x="timestamp", y=selected_var, markers=True,
+                        title=f"{selected_var} en tiempo real"),
+                use_container_width=True
+            )
+
+            with st.expander("🔎 Ver datos en tabla"):
+                st.dataframe(rt_df[["timestamp", selected_var]])
+
+    st.divider()
     st.subheader("⚠️ Resumen de Anomalías")
     anomaly_df = pd.DataFrame(current_data.get("anomaly_summary", {}).items(), columns=["Dataset", "Total"])
-    st.plotly_chart(px.bar(anomaly_df, x="Dataset", y="Total", color="Dataset"), use_container_width=True)
+    if not anomaly_df.empty:
+        st.plotly_chart(
+            px.bar(anomaly_df, x="Dataset", y="Total", color="Dataset", title="Anomalías por Dataset"),
+            use_container_width=True
+        )
+    else:
+        st.info("No se detectaron anomalías.")
 
 # --- Sección: Distribución ---
 elif seccion == "📊 Distribución":
@@ -81,8 +101,8 @@ elif seccion == "🔗 Correlación":
         corr = fetch_json(f"/correlation/{ds}")
         if corr:
             corr_df = pd.DataFrame(corr["correlation_matrix"])
-            fig = px.imshow(corr_df, text_auto=True, aspect="auto", title="Matriz de Correlación")
-            st.plotly_chart(fig, use_container_width=True)
+            fig = px.imshow(corr_df, text_auto=True, aspect="auto", title="Matriz de Correlación", width=1400, height=1000)
+            st.plotly_chart(fig, use_container_width=False)
 
 # --- Sección: Dispersión ---
 elif seccion == "⚖️ Dispersión":
